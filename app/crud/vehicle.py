@@ -60,7 +60,8 @@ class CRUDProductionBatch(CRUDBase[ProductionBatch, ProductionBatchCreate, Produ
             query = query.filter(ProductionBatch.plan_date >= after_date)
         return query.join(VehicleModel).order_by(
             ProductionBatch.plan_date,
-            VehicleModel.priority.desc()
+            VehicleModel.priority.desc(),
+            ProductionBatch.id
         ).all()
 
     def get_bom_quantity(self, db: Session, vehicle_model_id: int, material_id: int) -> Optional[int]:

@@ -6,13 +6,16 @@ from app.database import get_db
 from app.crud.supplier_confirmation import (
     crud_supplier_confirmation,
     crud_supplier_confirmation_batch,
+    crud_supplier_commitment_version,
     crud_supplier_shortage_impact
 )
 from app.schemas import (
     SupplierConfirmation, SupplierConfirmationCreate, SupplierConfirmationUpdate,
     SupplierConfirmationConfirm, SupplierConfirmationBatch,
     SupplierShortageImpact, SupplierConfirmationStatistics,
-    SupplierBottleneckAnalysis, SupplierConfirmationWithDetail
+    SupplierBottleneckAnalysis, SupplierConfirmationWithDetail,
+    SupplierCommitmentVersion, SupplierCommitmentVersionWithdraw,
+    SupplierCommitmentVersionDiff
 )
 from app.services.supplier_confirmation import SupplierConfirmationService
 
@@ -78,6 +81,65 @@ def get_confirmation_shortage_impacts(confirmation_id: int, db: Session = Depend
     if not conf:
         raise HTTPException(status_code=404, detail="供应商确认不存在")
     return crud_supplier_shortage_impact.get_by_confirmation(db, confirmation_id)
+
+@router.get("/{confirmation_id}/versions", response_model=List[SupplierCommitmentVersion])
+def get_confirmation_versions(confirmation_id: int, db: Session = Depends(get_db)):
+    """承诺版本列表：每次确认形成的不可覆盖版本（含分批计划与签署依据）"""
+    conf = crud_supplier_confirmation.get(db, confirmation_id)
+    if not conf:
+        raise HTTPException(status_code=404, detail="供应商确认不存在")
+    return crud_supplier_commitment_version.get_by_confirmation(db, confirmation_id)
+
+@router.get("/{confirmation_id}/versions/{version_no}", response_model=SupplierCommitmentVersion)
+def get_confirmation_version(confirmation_id: int, version_no: int, db: Session = Depends(get_db)):
+    version = crud_supplier_commitment_version.get_by_version_no(db, confirmation_id, version_no)
+    if not version:
+        raise HTTPException(status_code=404, detail="承诺版本不存在")
+    return version
+
+@router.get("/{confirmation_id}/version-diff", response_model=SupplierCommitmentVersionDiff)
+def get_version_diff(
+    confirmation_id: int,
+    from_version_no: Optional[int] = None,
+    to_version_no: Optional[int] = None,
+    db: Session = Depends(get_db)
+):
+    """版本差异：旧版与新版在可用日期、数量和受影响批次上的对比"""
+    try:
+        return SupplierConfirmationService.get_version_diff(
+            db, confirmation_id, from_version_no, to_version_no
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@router.post("/{confirmation_id}/withdraw", response_model=SupplierConfirmation)
+def withdraw_active_version(
+    confirmation_id: int,
+    withdraw_in: SupplierCommitmentVersionWithdraw,
+    db: Session = Depends(get_db)
+):
+    """撤回当前生效的承诺版本，回滚到上一版本（无则回到待确认）并重算影响"""
+    try:
+        return SupplierConfirmationService.withdraw_version(
+            db, confirmation_id, version_no=None, reason=withdraw_in.reason
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@router.post("/{confirmation_id}/versions/{version_no}/withdraw", response_model=SupplierConfirmation)
+def withdraw_version(
+    confirmation_id: int,
+    version_no: int,
+    withdraw_in: SupplierCommitmentVersionWithdraw,
+    db: Session = Depends(get_db)
+):
+    """撤回指定承诺版本"""
+    try:
+        return SupplierConfirmationService.withdraw_version(
+            db, confirmation_id, version_no=version_no, reason=withdraw_in.reason
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @router.post("", response_model=SupplierConfirmation)
 def create_confirmation(confirmation_in: SupplierConfirmationCreate, db: Session = Depends(get_db)):

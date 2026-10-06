@@ -2,7 +2,10 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import date
 from app.crud.base import CRUDBase
-from app.models import SupplierConfirmation, SupplierConfirmationBatch, SupplierShortageImpact
+from app.models import (
+    SupplierConfirmation, SupplierConfirmationBatch, SupplierShortageImpact,
+    SupplierCommitmentVersion, SupplierCommitmentVersionBatch
+)
 from app.schemas import (
     SupplierConfirmationCreate, SupplierConfirmationUpdate,
     SupplierConfirmationBatchCreate, SupplierShortageImpactCreate
@@ -56,17 +59,70 @@ class CRUDSupplierConfirmationBatch(CRUDBase[SupplierConfirmationBatch, Supplier
 
 crud_supplier_confirmation_batch = CRUDSupplierConfirmationBatch(SupplierConfirmationBatch)
 
+class CRUDSupplierCommitmentVersion(CRUDBase[SupplierCommitmentVersion, dict, dict]):
+    def get_by_confirmation(self, db: Session, confirmation_id: int) -> List[SupplierCommitmentVersion]:
+        return db.query(SupplierCommitmentVersion).filter(
+            SupplierCommitmentVersion.confirmation_id == confirmation_id
+        ).order_by(SupplierCommitmentVersion.version_no).all()
+
+    def get_active_by_confirmation(self, db: Session, confirmation_id: int) -> Optional[SupplierCommitmentVersion]:
+        return db.query(SupplierCommitmentVersion).filter(
+            SupplierCommitmentVersion.confirmation_id == confirmation_id,
+            SupplierCommitmentVersion.status == "active"
+        ).first()
+
+    def get_by_version_no(self, db: Session, confirmation_id: int, version_no: int) -> Optional[SupplierCommitmentVersion]:
+        return db.query(SupplierCommitmentVersion).filter(
+            SupplierCommitmentVersion.confirmation_id == confirmation_id,
+            SupplierCommitmentVersion.version_no == version_no
+        ).first()
+
+    def get_next_version_no(self, db: Session, confirmation_id: int) -> int:
+        versions = self.get_by_confirmation(db, confirmation_id)
+        return (versions[-1].version_no + 1) if versions else 1
+
+crud_supplier_commitment_version = CRUDSupplierCommitmentVersion(SupplierCommitmentVersion)
+
+class CRUDSupplierCommitmentVersionBatch(CRUDBase[SupplierCommitmentVersionBatch, dict, dict]):
+    def get_by_version(self, db: Session, version_id: int) -> List[SupplierCommitmentVersionBatch]:
+        return db.query(SupplierCommitmentVersionBatch).filter(
+            SupplierCommitmentVersionBatch.version_id == version_id
+        ).all()
+
+crud_supplier_commitment_version_batch = CRUDSupplierCommitmentVersionBatch(SupplierCommitmentVersionBatch)
+
 class CRUDSupplierShortageImpact(CRUDBase[SupplierShortageImpact, SupplierShortageImpactCreate, dict]):
     def get_by_confirmation(self, db: Session, confirmation_id: int) -> List[SupplierShortageImpact]:
-        return db.query(SupplierShortageImpact).filter(SupplierShortageImpact.confirmation_id == confirmation_id).all()
+        """当前生效的短缺影响（历史版本快照不返回）"""
+        return db.query(SupplierShortageImpact).filter(
+            SupplierShortageImpact.confirmation_id == confirmation_id,
+            SupplierShortageImpact.calc_status == "current"
+        ).all()
+
+    def get_history_by_confirmation(self, db: Session, confirmation_id: int) -> List[SupplierShortageImpact]:
+        """全部短缺影响（含历史版本快照），按版本与id排序保证稳定"""
+        return db.query(SupplierShortageImpact).filter(
+            SupplierShortageImpact.confirmation_id == confirmation_id
+        ).order_by(SupplierShortageImpact.version_id, SupplierShortageImpact.id).all()
+
+    def get_by_version(self, db: Session, version_id: int) -> List[SupplierShortageImpact]:
+        return db.query(SupplierShortageImpact).filter(
+            SupplierShortageImpact.version_id == version_id
+        ).order_by(SupplierShortageImpact.id).all()
 
     def get_by_production_batch(self, db: Session, production_batch_id: int) -> List[SupplierShortageImpact]:
-        return db.query(SupplierShortageImpact).filter(SupplierShortageImpact.production_batch_id == production_batch_id).all()
+        return db.query(SupplierShortageImpact).filter(
+            SupplierShortageImpact.production_batch_id == production_batch_id,
+            SupplierShortageImpact.calc_status == "current"
+        ).all()
 
     def get_by_supplier(self, db: Session, supplier_id: int) -> List[SupplierShortageImpact]:
         return db.query(SupplierShortageImpact).join(
             SupplierConfirmation, SupplierConfirmation.id == SupplierShortageImpact.confirmation_id
-        ).filter(SupplierConfirmation.supplier_id == supplier_id).all()
+        ).filter(
+            SupplierConfirmation.supplier_id == supplier_id,
+            SupplierShortageImpact.calc_status == "current"
+        ).all()
 
     def delete_by_confirmation(self, db: Session, confirmation_id: int) -> int:
         deleted = db.query(SupplierShortageImpact).filter(SupplierShortageImpact.confirmation_id == confirmation_id).delete()

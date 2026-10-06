@@ -7,6 +7,29 @@ from app.data.seed import seed_all
 
 Base.metadata.create_all(bind=engine)
 
+def _run_lightweight_migrations():
+    """为已存在的SQLite库补充新增列（新表由create_all自动创建）"""
+    from sqlalchemy import inspect, text
+    inspector = inspect(engine)
+    new_columns = {
+        "supplier_confirmations": {"current_version_id": "INTEGER"},
+        "supplier_shortage_impacts": {
+            "version_id": "INTEGER",
+            "calc_status": "VARCHAR(20) DEFAULT 'current'"
+        },
+        "purchase_orders": {"purchase_suggestion_id": "INTEGER"},
+    }
+    with engine.begin() as conn:
+        for table, columns in new_columns.items():
+            if not inspector.has_table(table):
+                continue
+            existing = {c["name"] for c in inspector.get_columns(table)}
+            for column, column_type in columns.items():
+                if column not in existing:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"))
+
+_run_lightweight_migrations()
+
 app = FastAPI(
     title=settings.PROJECT_NAME,
     description="国产自行车零部件供应协同系统 - 从一颗滚珠到整套飞轮，零部件供应协同平台",

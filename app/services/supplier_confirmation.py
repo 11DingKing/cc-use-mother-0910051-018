@@ -4,9 +4,11 @@ from datetime import date, datetime, timedelta
 from app.crud.supplier_confirmation import (
     crud_supplier_confirmation,
     crud_supplier_confirmation_batch,
+    crud_supplier_commitment_version,
+    crud_supplier_commitment_version_batch,
     crud_supplier_shortage_impact
 )
-from app.crud.purchase import crud_purchase_suggestion, crud_inventory_batch
+from app.crud.purchase import crud_purchase_suggestion, crud_inventory_batch, crud_purchase_order
 from app.crud.vehicle import crud_vehicle, crud_production_batch
 from app.crud.supplier import crud_supplier, crud_supply_capacity
 from app.crud.material import crud_material
@@ -14,9 +16,15 @@ from app.schemas import (
     SupplierConfirmationCreate, SupplierConfirmationConfirm,
     SupplierConfirmationBatchCreate, SupplierShortageImpactCreate,
     SupplierConfirmationStatistics, SupplierBottleneckAnalysis,
-    SupplierBottleneckBatch, Material
+    SupplierBottleneckBatch, Material,
+    SupplierCommitmentVersionDiff, SupplierCommitmentBatchScheduleChange,
+    SupplierCommitmentImpactDiff
 )
-from app.models import SupplierConfirmation, SupplierShortageImpact
+from app.models import (
+    SupplierConfirmation, SupplierShortageImpact,
+    SupplierCommitmentVersion, SupplierCommitmentVersionBatch,
+    SupplierConfirmationBatch
+)
 
 class SupplierConfirmationService:
 
@@ -59,12 +67,19 @@ class SupplierConfirmationService:
         confirmation_id: int,
         confirm_data: SupplierConfirmationConfirm
     ) -> SupplierConfirmation:
+        """供应商确认：每次确认生成一个不可覆盖的承诺版本，并重新计算短缺影响"""
         confirmation = crud_supplier_confirmation.get(db, confirmation_id)
         if not confirmation:
             raise ValueError(f"供应商确认不存在: {confirmation_id}")
-        if confirmation.status not in ("pending", "revised"):
+        if confirmation.status not in ("pending", "revised", "confirmed", "shortage"):
             raise ValueError(f"当前状态不允许确认: {confirmation.status}")
         committed_qty = confirm_data.committed_quantity
+        if committed_qty < 0:
+            raise ValueError("承诺数量不能为负数")
+        # 已完成到货从可调整范围中扣除：新承诺数量不得低于已到货量
+        delivered_qty = SupplierConfirmationService._get_delivered_quantity(db, confirmation)
+        if committed_qty < delivered_qty:
+            raise ValueError(f"已完成到货{delivered_qty}件不可调整，承诺数量不能低于已到货量")
         shortage_qty = max(0, confirmation.requested_quantity - committed_qty)
         committed_date = confirm_data.committed_delivery_date
         status = "confirmed"
@@ -73,8 +88,42 @@ class SupplierConfirmationService:
         batches_total = sum(b.quantity for b in confirm_data.batches) if confirm_data.batches else 0
         if confirm_data.batches and batches_total != committed_qty:
             raise ValueError(f"分批到货数量合计({batches_total})与承诺数量({committed_qty})不一致")
-        crud_supplier_shortage_impact.delete_by_confirmation(db, confirmation_id)
-        updated = crud_supplier_confirmation.update(
+
+        # 旧生效版本标记为已被取代，历史版本内容保持不可覆盖
+        active_version = crud_supplier_commitment_version.get_active_by_confirmation(db, confirmation_id)
+        if active_version:
+            active_version.status = "superseded"
+            db.add(active_version)
+
+        # 生成新版本：包含分批到货计划与供应商签署依据
+        version = SupplierCommitmentVersion(
+            confirmation_id=confirmation_id,
+            version_no=crud_supplier_commitment_version.get_next_version_no(db, confirmation_id),
+            committed_quantity=committed_qty,
+            committed_delivery_date=committed_date,
+            shortage_quantity=shortage_qty,
+            status="active",
+            confirmation_note=confirm_data.confirmation_note,
+            signed_by=confirm_data.signed_by,
+            signature_basis=confirm_data.signature_basis,
+            signed_at=datetime.now(),
+            locked_delivered_quantity=delivered_qty
+        )
+        db.add(version)
+        db.flush()
+        for batch_data in confirm_data.batches:
+            db.add(SupplierCommitmentVersionBatch(
+                version_id=version.id,
+                batch_no=batch_data.batch_no,
+                quantity=batch_data.quantity,
+                planned_date=batch_data.planned_date,
+                remark=batch_data.remark
+            ))
+
+        # 同步旧分批表为当前生效版本的镜像，保持既有查询行为
+        SupplierConfirmationService._mirror_batches_from_data(db, confirmation_id, confirm_data.batches)
+
+        crud_supplier_confirmation.update(
             db,
             db_obj=confirmation,
             obj_in={
@@ -83,49 +132,196 @@ class SupplierConfirmationService:
                 "shortage_quantity": shortage_qty,
                 "status": status,
                 "confirmation_note": confirm_data.confirmation_note,
-                "confirmed_at": datetime.now()
+                "confirmed_at": datetime.now(),
+                "current_version_id": version.id
             }
         )
+        SupplierConfirmationService._recalculate_shortage_impact(db, confirmation_id)
+        SupplierConfirmationService._sync_delay_impact_with_supplier(db, confirmation_id)
+        return crud_supplier_confirmation.get(db, confirmation_id)
+
+    @staticmethod
+    def withdraw_version(
+        db: Session,
+        confirmation_id: int,
+        version_no: Optional[int] = None,
+        reason: Optional[str] = None
+    ) -> SupplierConfirmation:
+        """撤回承诺版本：撤回生效版本时回滚到上一可用版本（无则回到待确认），并重新计算影响"""
+        confirmation = crud_supplier_confirmation.get(db, confirmation_id)
+        if not confirmation:
+            raise ValueError(f"供应商确认不存在: {confirmation_id}")
+        if version_no is not None:
+            version = crud_supplier_commitment_version.get_by_version_no(db, confirmation_id, version_no)
+            if not version:
+                raise ValueError(f"承诺版本不存在: v{version_no}")
+        else:
+            version = crud_supplier_commitment_version.get_active_by_confirmation(db, confirmation_id)
+            if not version:
+                raise ValueError("当前没有生效中的承诺版本可撤回")
+        if version.status == "withdrawn":
+            raise ValueError(f"版本v{version.version_no}已撤回，不可重复撤回")
+
+        was_active = version.status == "active"
+        version.status = "withdrawn"
+        version.withdraw_reason = reason
+        db.add(version)
+
+        if was_active:
+            candidates = [
+                v for v in crud_supplier_commitment_version.get_by_confirmation(db, confirmation_id)
+                if v.status == "superseded"
+            ]
+            rollback = max(candidates, key=lambda v: v.version_no) if candidates else None
+            if rollback:
+                rollback.status = "active"
+                db.add(rollback)
+                confirmation.committed_quantity = rollback.committed_quantity
+                confirmation.committed_delivery_date = rollback.committed_delivery_date
+                confirmation.shortage_quantity = rollback.shortage_quantity
+                confirmation.status = "shortage" if rollback.shortage_quantity > 0 else "confirmed"
+                confirmation.confirmation_note = rollback.confirmation_note
+                confirmation.current_version_id = rollback.id
+                SupplierConfirmationService._mirror_batches_from_version(db, confirmation_id, rollback)
+            else:
+                confirmation.committed_quantity = 0
+                confirmation.committed_delivery_date = None
+                confirmation.shortage_quantity = 0
+                confirmation.status = "pending"
+                confirmation.current_version_id = None
+                SupplierConfirmationService._mirror_batches_from_data(db, confirmation_id, [])
+            db.add(confirmation)
+        db.commit()
+        SupplierConfirmationService._recalculate_shortage_impact(db, confirmation_id)
+        return crud_supplier_confirmation.get(db, confirmation_id)
+
+    @staticmethod
+    def _get_delivered_quantity(db: Session, confirmation: SupplierConfirmation) -> int:
+        """已完成到货量：同一采购建议转出的采购单累计到货，该部分不可再调整"""
+        from app.models import Delivery
+        orders = crud_purchase_order.get_by_purchase_suggestion(db, confirmation.purchase_suggestion_id)
+        if not orders:
+            return 0
+        order_ids = [o.id for o in orders]
+        deliveries = db.query(Delivery).filter(Delivery.purchase_order_id.in_(order_ids)).all()
+        return sum(d.quantity for d in deliveries)
+
+    @staticmethod
+    def _mirror_batches_from_data(db: Session, confirmation_id: int, batches_data) -> None:
+        """将旧分批表刷新为给定分批数据的镜像"""
         existing_batches = crud_supplier_confirmation_batch.get_by_confirmation(db, confirmation_id)
         for eb in existing_batches:
             db.delete(eb)
-        db.commit()
-        for batch_data in confirm_data.batches:
-            from app.models import SupplierConfirmationBatch
-            batch = SupplierConfirmationBatch(
+        db.flush()
+        for batch_data in batches_data:
+            db.add(SupplierConfirmationBatch(
                 confirmation_id=confirmation_id,
                 batch_no=batch_data.batch_no,
                 quantity=batch_data.quantity,
                 planned_date=batch_data.planned_date,
                 remark=batch_data.remark
-            )
-            db.add(batch)
-        if confirm_data.batches:
-            db.commit()
-        if shortage_qty > 0:
-            SupplierConfirmationService._recalculate_shortage_impact(db, confirmation_id)
-        SupplierConfirmationService._sync_delay_impact_with_supplier(db, confirmation_id)
-        return crud_supplier_confirmation.get(db, confirmation_id)
+            ))
+        db.flush()
+        # 使父对象已加载的分批集合失效，避免后续级联访问到已删除的镜像实例
+        confirmation = db.get(SupplierConfirmation, confirmation_id)
+        if confirmation is not None:
+            db.expire(confirmation, ["batches"])
+
+    @staticmethod
+    def _mirror_batches_from_version(db: Session, confirmation_id: int, version: SupplierCommitmentVersion) -> None:
+        """将旧分批表刷新为指定承诺版本分批计划的镜像"""
+        version_batches = crud_supplier_commitment_version_batch.get_by_version(db, version.id)
+        SupplierConfirmationService._mirror_batches_from_data(db, confirmation_id, version_batches)
 
     @staticmethod
     def _recalculate_shortage_impact(db: Session, confirmation_id: int) -> List[SupplierShortageImpact]:
+        """重新计算短缺影响。
+
+        计算结果是输入数据的纯函数，重复执行得到稳定结果：
+        - 与当前生效记录内容一致时不做任何变更（记录id保持稳定）；
+        - 版本切换时，旧版本记录冻结为历史快照（可追溯到触发版本）；
+        - 回滚场景下当前版本已有的历史快照内容一致则直接恢复生效。
+        """
         confirmation = crud_supplier_confirmation.get(db, confirmation_id)
-        if not confirmation or confirmation.shortage_quantity <= 0:
+        if not confirmation:
             return []
+        computed: List[dict] = []
+        if confirmation.shortage_quantity > 0:
+            computed = SupplierConfirmationService._compute_shortage_impacts(db, confirmation)
+        current_version_id = confirmation.current_version_id
+        existing_current = crud_supplier_shortage_impact.get_by_confirmation(db, confirmation_id)
+
+        def sig_of_dict(d: dict) -> Tuple:
+            return (d["production_batch_id"], d["shortage_material_id"], d["shortage_quantity"],
+                    d["impact_level"], d["estimated_delay_days"])
+
+        def sig_of_obj(o: SupplierShortageImpact) -> Tuple:
+            return (o.production_batch_id, o.shortage_material_id, o.shortage_quantity,
+                    o.impact_level, o.estimated_delay_days)
+
+        computed_sigs = sorted(sig_of_dict(c) for c in computed)
+        existing_sigs = sorted(sig_of_obj(e) for e in existing_current)
+        same_version = all(e.version_id == current_version_id for e in existing_current)
+        if computed_sigs == existing_sigs and same_version:
+            return existing_current
+
+        # 同版本重算：替换旧记录；跨版本切换：旧记录冻结为历史快照
+        for imp in existing_current:
+            if imp.version_id == current_version_id:
+                db.delete(imp)
+            else:
+                imp.calc_status = "superseded"
+                db.add(imp)
+        db.flush()
+
+        # 当前版本已有内容一致的历史快照则恢复生效，保证回滚结果稳定
+        reusable: List[SupplierShortageImpact] = []
+        if current_version_id is not None:
+            reusable = [
+                i for i in crud_supplier_shortage_impact.get_by_version(db, current_version_id)
+                if i.calc_status == "superseded"
+            ]
+        impacts: List[SupplierShortageImpact] = []
+        remaining = list(computed)
+        for comp in list(remaining):
+            sig = sig_of_dict(comp)
+            match = next((r for r in reusable if sig_of_obj(r) == sig), None)
+            if match:
+                match.calc_status = "current"
+                db.add(match)
+                reusable.remove(match)
+                impacts.append(match)
+                remaining.remove(comp)
+        for comp in remaining:
+            impact = SupplierShortageImpact(
+                confirmation_id=confirmation_id,
+                version_id=current_version_id,
+                calc_status="current",
+                **comp
+            )
+            db.add(impact)
+            impacts.append(impact)
+        db.commit()
+        for imp in impacts:
+            db.refresh(imp)
+        return impacts
+
+    @staticmethod
+    def _compute_shortage_impacts(db: Session, confirmation: SupplierConfirmation) -> List[dict]:
+        """纯计算当前缺口对生产批次的影响，排序确定，重复执行结果一致"""
         material_id = confirmation.material_id
         shortage_qty = confirmation.shortage_quantity
+        if shortage_qty <= 0:
+            return []
 
         current_stock = crud_inventory_batch.get_total_stock(db, material_id)
-
-        from app.crud.purchase import crud_purchase_order
         in_transit_orders = crud_purchase_order.get_in_transit_by_material_ordered_by_date(db, material_id)
-        committed_date = confirmation.committed_delivery_date or date.today()
 
-        adjusted_in_transit = []
-        for order in in_transit_orders:
-            if order["order_id"] == confirmation_id:
-                continue
-            adjusted_in_transit.append(order)
+        # 本确认单同一采购建议转出的采购单不重复计入在途（其承诺量已体现在缺口中）
+        own_order_ids = {
+            o.id for o in crud_purchase_order.get_by_purchase_suggestion(db, confirmation.purchase_suggestion_id)
+        }
+        adjusted_in_transit = [o for o in in_transit_orders if o["order_id"] not in own_order_ids]
 
         class MaterialPool:
             def __init__(self, initial_stock: int, in_transit: List[dict]):
@@ -185,7 +381,8 @@ class SupplierConfirmationService:
         ]
         relevant_batches.sort(key=lambda b: (
             b.plan_date,
-            -b.vehicle_model.priority if b.vehicle_model else 0
+            -(b.vehicle_model.priority if b.vehicle_model else 0),
+            b.id
         ))
 
         from app.crud.alternative import crud_alternative_material, crud_alternative_restriction
@@ -211,7 +408,7 @@ class SupplierConfirmationService:
                 "total_stock": total_alt_qty
             }
 
-        impacts: List[SupplierShortageImpact] = []
+        computed: List[dict] = []
         remaining_shortage = shortage_qty
 
         for batch in relevant_batches:
@@ -248,29 +445,20 @@ class SupplierConfirmationService:
             max_vehicles = actual_affected_qty // bom_qty if bom_qty > 0 else 0
             remark = f"供应商缺料{shortage_qty}件，本批次缺口{actual_affected_qty}件，影响约{max_vehicles}台整车"
 
-            from app.models import SupplierShortageImpact as ImpactModel
-            impact = ImpactModel(
-                confirmation_id=confirmation_id,
-                production_batch_id=batch.id,
-                affected_vehicle_model_id=vm_id,
-                shortage_material_id=material_id,
-                shortage_quantity=actual_affected_qty,
-                impact_level=impact_level,
-                estimated_delay_days=delay_days,
-                remark=remark
-            )
-            db.add(impact)
-            db.flush()
-            impacts.append(impact)
+            computed.append({
+                "production_batch_id": batch.id,
+                "affected_vehicle_model_id": vm_id,
+                "shortage_material_id": material_id,
+                "shortage_quantity": actual_affected_qty,
+                "impact_level": impact_level,
+                "estimated_delay_days": delay_days,
+                "remark": remark
+            })
             remaining_shortage -= actual_affected_qty
 
             pool.consume(available_on_time, batch.plan_date)
 
-        if impacts:
-            db.commit()
-            for imp in impacts:
-                db.refresh(imp)
-        return impacts
+        return computed
 
     @staticmethod
     def _assess_impact(
@@ -314,6 +502,126 @@ class SupplierConfirmationService:
         if delay_days > 0:
             from app.services.delay_analysis import DelayAnalysisService
             pass
+
+    @staticmethod
+    def get_version_diff(
+        db: Session,
+        confirmation_id: int,
+        from_version_no: Optional[int] = None,
+        to_version_no: Optional[int] = None
+    ) -> SupplierCommitmentVersionDiff:
+        """对比两个承诺版本在可用日期、数量与受影响批次上的差异。
+
+        默认对比最新版本与其前一版本；影响数据取各版本冻结的历史快照。
+        """
+        confirmation = crud_supplier_confirmation.get(db, confirmation_id)
+        if not confirmation:
+            raise ValueError(f"供应商确认不存在: {confirmation_id}")
+        versions = crud_supplier_commitment_version.get_by_confirmation(db, confirmation_id)
+        if not versions:
+            raise ValueError("该确认单暂无承诺版本")
+        if to_version_no is not None:
+            to_version = crud_supplier_commitment_version.get_by_version_no(db, confirmation_id, to_version_no)
+            if not to_version:
+                raise ValueError(f"承诺版本不存在: v{to_version_no}")
+        else:
+            to_version = versions[-1]
+        if from_version_no is not None:
+            from_version = crud_supplier_commitment_version.get_by_version_no(db, confirmation_id, from_version_no)
+            if not from_version:
+                raise ValueError(f"承诺版本不存在: v{from_version_no}")
+        else:
+            earlier = [v for v in versions if v.version_no < to_version.version_no]
+            if not earlier:
+                raise ValueError("没有可对比的历史版本")
+            from_version = earlier[-1]
+
+        if from_version.committed_delivery_date and to_version.committed_delivery_date:
+            date_change_days = (to_version.committed_delivery_date - from_version.committed_delivery_date).days
+        else:
+            date_change_days = None
+
+        # 分批到货计划差异（按批次号匹配）
+        from_batches = {b.batch_no: b for b in from_version.batches}
+        to_batches = {b.batch_no: b for b in to_version.batches}
+        schedule_changes: List[SupplierCommitmentBatchScheduleChange] = []
+        for batch_no in sorted(set(from_batches) | set(to_batches)):
+            fb = from_batches.get(batch_no)
+            tb = to_batches.get(batch_no)
+            if fb and not tb:
+                schedule_changes.append(SupplierCommitmentBatchScheduleChange(
+                    batch_no=batch_no, change_type="removed",
+                    old_quantity=fb.quantity, old_planned_date=fb.planned_date
+                ))
+            elif tb and not fb:
+                schedule_changes.append(SupplierCommitmentBatchScheduleChange(
+                    batch_no=batch_no, change_type="added",
+                    new_quantity=tb.quantity, new_planned_date=tb.planned_date
+                ))
+            elif fb.quantity != tb.quantity or fb.planned_date != tb.planned_date:
+                schedule_changes.append(SupplierCommitmentBatchScheduleChange(
+                    batch_no=batch_no, change_type="changed",
+                    old_quantity=fb.quantity, new_quantity=tb.quantity,
+                    old_planned_date=fb.planned_date, new_planned_date=tb.planned_date
+                ))
+
+        # 受影响生产批次差异（取各版本冻结的影响快照，按生产批次匹配）
+        from_impacts = {i.production_batch_id: i for i in crud_supplier_shortage_impact.get_by_version(db, from_version.id)}
+        to_impacts = {i.production_batch_id: i for i in crud_supplier_shortage_impact.get_by_version(db, to_version.id)}
+        added: List[SupplierCommitmentImpactDiff] = []
+        removed: List[SupplierCommitmentImpactDiff] = []
+        changed: List[SupplierCommitmentImpactDiff] = []
+        for pb_id in sorted(set(from_impacts) | set(to_impacts)):
+            fi = from_impacts.get(pb_id)
+            ti = to_impacts.get(pb_id)
+            ref = ti or fi
+            pb = ref.production_batch
+            base = {
+                "production_batch_id": pb_id,
+                "production_batch_no": pb.batch_no if pb else "",
+                "vehicle_model_name": ref.vehicle_model.name if ref.vehicle_model else "",
+                "plan_date": pb.plan_date if pb else None
+            }
+            if ti and not fi:
+                added.append(SupplierCommitmentImpactDiff(
+                    **base, change_type="added",
+                    new_shortage_quantity=ti.shortage_quantity,
+                    new_impact_level=ti.impact_level,
+                    new_estimated_delay_days=ti.estimated_delay_days
+                ))
+            elif fi and not ti:
+                removed.append(SupplierCommitmentImpactDiff(
+                    **base, change_type="removed",
+                    old_shortage_quantity=fi.shortage_quantity,
+                    old_impact_level=fi.impact_level,
+                    old_estimated_delay_days=fi.estimated_delay_days
+                ))
+            elif (fi.shortage_quantity != ti.shortage_quantity or
+                  fi.impact_level != ti.impact_level or
+                  fi.estimated_delay_days != ti.estimated_delay_days):
+                changed.append(SupplierCommitmentImpactDiff(
+                    **base, change_type="changed",
+                    old_shortage_quantity=fi.shortage_quantity,
+                    new_shortage_quantity=ti.shortage_quantity,
+                    old_impact_level=fi.impact_level,
+                    new_impact_level=ti.impact_level,
+                    old_estimated_delay_days=fi.estimated_delay_days,
+                    new_estimated_delay_days=ti.estimated_delay_days
+                ))
+
+        return SupplierCommitmentVersionDiff(
+            confirmation_id=confirmation_id,
+            confirmation_no=confirmation.confirmation_no,
+            from_version=from_version,
+            to_version=to_version,
+            committed_quantity_change=to_version.committed_quantity - from_version.committed_quantity,
+            shortage_quantity_change=to_version.shortage_quantity - from_version.shortage_quantity,
+            delivery_date_change_days=date_change_days,
+            batch_schedule_changes=schedule_changes,
+            affected_batches_added=added,
+            affected_batches_removed=removed,
+            affected_batches_changed=changed
+        )
 
     @staticmethod
     def get_pending_confirmations(db: Session, supplier_id: Optional[int] = None) -> List[SupplierConfirmation]:

@@ -111,6 +111,7 @@ class PurchaseOrder(Base):
     expected_date = Column(Date, nullable=False)
     actual_date = Column(Date)
     status = Column(String(20), default="ordered")
+    purchase_suggestion_id = Column(Integer, ForeignKey("purchase_suggestions.id"))
     remark = Column(Text)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -237,6 +238,8 @@ class SupplierConfirmation(Base):
     status = Column(String(20), default="pending")
     confirmation_note = Column(Text)
     confirmed_at = Column(DateTime(timezone=True))
+    # 当前生效的承诺版本id（普通列，由应用层维护，避免与版本表形成循环外键）
+    current_version_id = Column(Integer)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -245,6 +248,43 @@ class SupplierConfirmation(Base):
     purchase_suggestion = relationship("PurchaseSuggestion")
     batches = relationship("SupplierConfirmationBatch", back_populates="confirmation", cascade="all, delete-orphan")
     shortage_impacts = relationship("SupplierShortageImpact", back_populates="confirmation", cascade="all, delete-orphan")
+    versions = relationship("SupplierCommitmentVersion", back_populates="confirmation",
+                            cascade="all, delete-orphan", order_by="SupplierCommitmentVersion.version_no")
+
+class SupplierCommitmentVersion(Base):
+    """供应商承诺版本：每次确认生成一条，不可覆盖，含签署依据与分批到货计划"""
+    __tablename__ = "supplier_commitment_versions"
+    id = Column(Integer, primary_key=True, index=True)
+    confirmation_id = Column(Integer, ForeignKey("supplier_confirmations.id"), nullable=False)
+    version_no = Column(Integer, nullable=False)
+    committed_quantity = Column(Integer, nullable=False)
+    committed_delivery_date = Column(Date)
+    shortage_quantity = Column(Integer, default=0)
+    status = Column(String(20), default="active")  # active=生效中 superseded=被新版取代 withdrawn=已撤回
+    confirmation_note = Column(Text)
+    signed_by = Column(String(50))
+    signature_basis = Column(String(200))
+    signed_at = Column(DateTime(timezone=True))
+    locked_delivered_quantity = Column(Integer, default=0)
+    withdraw_reason = Column(String(300))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    confirmation = relationship("SupplierConfirmation", back_populates="versions")
+    batches = relationship("SupplierCommitmentVersionBatch", back_populates="version", cascade="all, delete-orphan")
+    shortage_impacts = relationship("SupplierShortageImpact", back_populates="version")
+
+class SupplierCommitmentVersionBatch(Base):
+    """承诺版本的分批到货计划（不可变快照）"""
+    __tablename__ = "supplier_commitment_version_batches"
+    id = Column(Integer, primary_key=True, index=True)
+    version_id = Column(Integer, ForeignKey("supplier_commitment_versions.id"), nullable=False)
+    batch_no = Column(String(50), nullable=False)
+    quantity = Column(Integer, nullable=False)
+    planned_date = Column(Date, nullable=False)
+    remark = Column(String(300))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    version = relationship("SupplierCommitmentVersion", back_populates="batches")
 
 class SupplierConfirmationBatch(Base):
     __tablename__ = "supplier_confirmation_batches"
@@ -262,6 +302,8 @@ class SupplierShortageImpact(Base):
     __tablename__ = "supplier_shortage_impacts"
     id = Column(Integer, primary_key=True, index=True)
     confirmation_id = Column(Integer, ForeignKey("supplier_confirmations.id"), nullable=False)
+    version_id = Column(Integer, ForeignKey("supplier_commitment_versions.id"))
+    calc_status = Column(String(20), default="current")  # current=当前生效 superseded=历史版本快照
     production_batch_id = Column(Integer, ForeignKey("production_batches.id"), nullable=False)
     affected_vehicle_model_id = Column(Integer, ForeignKey("vehicle_models.id"), nullable=False)
     shortage_material_id = Column(Integer, ForeignKey("materials.id"), nullable=False)
@@ -272,6 +314,7 @@ class SupplierShortageImpact(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     confirmation = relationship("SupplierConfirmation", back_populates="shortage_impacts")
+    version = relationship("SupplierCommitmentVersion", back_populates="shortage_impacts")
     production_batch = relationship("ProductionBatch")
     vehicle_model = relationship("VehicleModel")
     material = relationship("Material")

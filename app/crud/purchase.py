@@ -86,7 +86,7 @@ class CRUDPurchaseOrder(CRUDBase[PurchaseOrder, PurchaseOrderCreate, PurchaseOrd
         orders = db.query(PurchaseOrder).filter(
             PurchaseOrder.material_id == material_id,
             PurchaseOrder.status.in_(["ordered", "partial"])
-        ).order_by(PurchaseOrder.expected_date).all()
+        ).order_by(PurchaseOrder.expected_date, PurchaseOrder.id).all()
         result = []
         for order in orders:
             delivered = db.query(Delivery).filter(
@@ -101,6 +101,11 @@ class CRUDPurchaseOrder(CRUDBase[PurchaseOrder, PurchaseOrderCreate, PurchaseOrd
                     "remaining_quantity": remaining_qty
                 })
         return result
+
+    def get_by_purchase_suggestion(self, db: Session, suggestion_id: int) -> List[PurchaseOrder]:
+        return db.query(PurchaseOrder).filter(
+            PurchaseOrder.purchase_suggestion_id == suggestion_id
+        ).order_by(PurchaseOrder.id).all()
 
 crud_purchase_order = CRUDPurchaseOrder(PurchaseOrder)
 

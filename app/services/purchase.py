@@ -241,6 +241,7 @@ class PurchaseService:
             quantity=final_quantity,
             expected_date=final_date,
             status="ordered",
+            purchase_suggestion_id=suggestion_id,
             remark="；".join(remark_parts)
         )
         order = crud_purchase_order.create(db, obj_in=order_in)

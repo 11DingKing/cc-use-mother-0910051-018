@@ -155,7 +155,7 @@ class PurchaseOrderBase(BaseModel):
     remark: Optional[str] = None
 
 class PurchaseOrderCreate(PurchaseOrderBase):
-    pass
+    purchase_suggestion_id: Optional[int] = None
 
 class PurchaseOrderUpdate(BaseModel):
     actual_date: Optional[date] = None
@@ -165,6 +165,7 @@ class PurchaseOrderUpdate(BaseModel):
 class PurchaseOrder(PurchaseOrderBase):
     id: int
     actual_date: Optional[date] = None
+    purchase_suggestion_id: Optional[int] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
     supplier: Optional[Supplier] = None
@@ -407,6 +408,42 @@ class SupplierConfirmationBatch(SupplierConfirmationBatchBase):
     class Config:
         from_attributes = True
 
+class SupplierCommitmentVersionBatchBase(BaseModel):
+    batch_no: str
+    quantity: int
+    planned_date: date
+    remark: Optional[str] = None
+
+class SupplierCommitmentVersionBatch(SupplierCommitmentVersionBatchBase):
+    id: int
+    version_id: int
+    created_at: datetime
+    class Config:
+        from_attributes = True
+
+class SupplierCommitmentVersion(BaseModel):
+    """承诺版本（不可覆盖），含分批到货计划与供应商签署依据"""
+    id: int
+    confirmation_id: int
+    version_no: int
+    committed_quantity: int
+    committed_delivery_date: Optional[date] = None
+    shortage_quantity: int = 0
+    status: str
+    confirmation_note: Optional[str] = None
+    signed_by: Optional[str] = None
+    signature_basis: Optional[str] = None
+    signed_at: Optional[datetime] = None
+    locked_delivered_quantity: int = 0
+    withdraw_reason: Optional[str] = None
+    created_at: datetime
+    batches: List[SupplierCommitmentVersionBatch] = []
+    class Config:
+        from_attributes = True
+
+class SupplierCommitmentVersionWithdraw(BaseModel):
+    reason: Optional[str] = None
+
 class SupplierShortageImpactBase(BaseModel):
     production_batch_id: int
     affected_vehicle_model_id: int
@@ -422,6 +459,8 @@ class SupplierShortageImpactCreate(SupplierShortageImpactBase):
 class SupplierShortageImpact(SupplierShortageImpactBase):
     id: int
     confirmation_id: int
+    version_id: Optional[int] = None
+    calc_status: str = "current"
     created_at: datetime
     production_batch: Optional[ProductionBatch] = None
     vehicle_model: Optional[VehicleModel] = None
@@ -448,6 +487,8 @@ class SupplierConfirmationConfirm(BaseModel):
     committed_quantity: int
     committed_delivery_date: Optional[date] = None
     confirmation_note: Optional[str] = None
+    signed_by: Optional[str] = None
+    signature_basis: Optional[str] = None
     batches: List[SupplierConfirmationBatchCreate] = []
 
 class SupplierConfirmationUpdate(BaseModel):
@@ -459,6 +500,7 @@ class SupplierConfirmationUpdate(BaseModel):
 
 class SupplierConfirmation(SupplierConfirmationBase):
     id: int
+    current_version_id: Optional[int] = None
     confirmed_at: Optional[datetime] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
@@ -474,6 +516,43 @@ class SupplierConfirmationWithDetail(SupplierConfirmation):
 
 class SupplierRecalculateShortageRequest(BaseModel):
     confirmation_id: int
+
+class SupplierCommitmentBatchScheduleChange(BaseModel):
+    """新旧版本分批到货计划的单行差异"""
+    batch_no: str
+    change_type: str  # added=新版新增 removed=新版移除 changed=数量或日期变化
+    old_quantity: Optional[int] = None
+    new_quantity: Optional[int] = None
+    old_planned_date: Optional[date] = None
+    new_planned_date: Optional[date] = None
+
+class SupplierCommitmentImpactDiff(BaseModel):
+    """新旧版本在同一生产批次上的影响差异"""
+    production_batch_id: int
+    production_batch_no: str
+    vehicle_model_name: str
+    plan_date: Optional[date] = None
+    change_type: str  # added=新版新增 affected removed=新版不再影响 changed=影响程度变化
+    old_shortage_quantity: int = 0
+    new_shortage_quantity: int = 0
+    old_impact_level: Optional[str] = None
+    new_impact_level: Optional[str] = None
+    old_estimated_delay_days: int = 0
+    new_estimated_delay_days: int = 0
+
+class SupplierCommitmentVersionDiff(BaseModel):
+    """旧版与新版承诺在可用日期、数量与受影响批次上的差异"""
+    confirmation_id: int
+    confirmation_no: str
+    from_version: SupplierCommitmentVersion
+    to_version: SupplierCommitmentVersion
+    committed_quantity_change: int
+    shortage_quantity_change: int
+    delivery_date_change_days: Optional[int] = None
+    batch_schedule_changes: List[SupplierCommitmentBatchScheduleChange] = []
+    affected_batches_added: List[SupplierCommitmentImpactDiff] = []
+    affected_batches_removed: List[SupplierCommitmentImpactDiff] = []
+    affected_batches_changed: List[SupplierCommitmentImpactDiff] = []
 
 class SupplierBottleneckBatch(BaseModel):
     production_batch_id: int
