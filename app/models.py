@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Text, Date
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Text, Date, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.database import Base
@@ -119,6 +119,7 @@ class PurchaseOrder(Base):
     material = relationship("Material", back_populates="purchase_orders")
     deliveries = relationship("Delivery", back_populates="purchase_order")
     delay_impacts = relationship("DelayImpact", back_populates="purchase_order")
+    commitment_versions = relationship("CommitmentVersion", back_populates="purchase_order")
 
 class Delivery(Base):
     __tablename__ = "deliveries"
@@ -275,3 +276,76 @@ class SupplierShortageImpact(Base):
     production_batch = relationship("ProductionBatch")
     vehicle_model = relationship("VehicleModel")
     material = relationship("Material")
+
+class CommitmentVersion(Base):
+    """供应商承诺版本：每次承诺不可覆盖，含签署依据与分批到货计划"""
+    __tablename__ = "commitment_versions"
+    id = Column(Integer, primary_key=True, index=True)
+    version_no = Column(String(60), unique=True, index=True, nullable=False)
+    purchase_order_id = Column(Integer, ForeignKey("purchase_orders.id"), nullable=False)
+    version_number = Column(Integer, nullable=False)
+    committed_quantity = Column(Integer, nullable=False)
+    committed_delivery_date = Column(Date)
+    delivered_quantity = Column(Integer, default=0)
+    adjustable_quantity = Column(Integer, default=0)
+    status = Column(String(20), default="published")
+    signed_by = Column(String(50), nullable=False)
+    signature_doc = Column(String(200), nullable=False)
+    signed_at = Column(DateTime(timezone=True))
+    note = Column(Text)
+    published_at = Column(DateTime(timezone=True))
+    withdrawn_at = Column(DateTime(timezone=True))
+    withdraw_reason = Column(String(300))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    purchase_order = relationship("PurchaseOrder", back_populates="commitment_versions")
+    batches = relationship("CommitmentVersionBatch", back_populates="version",
+                           cascade="all, delete-orphan",
+                           order_by="CommitmentVersionBatch.planned_date")
+    impacts = relationship("CommitmentImpact", back_populates="version",
+                           cascade="all, delete-orphan",
+                           order_by="CommitmentImpact.production_batch_id")
+
+    __table_args__ = (
+        UniqueConstraint("purchase_order_id", "version_number", name="uq_commitment_version_order_number"),
+    )
+
+class CommitmentVersionBatch(Base):
+    """承诺版本的分批到货计划，随版本固化不可修改"""
+    __tablename__ = "commitment_version_batches"
+    id = Column(Integer, primary_key=True, index=True)
+    version_id = Column(Integer, ForeignKey("commitment_versions.id"), nullable=False)
+    batch_no = Column(String(50), nullable=False)
+    quantity = Column(Integer, nullable=False)
+    planned_date = Column(Date, nullable=False)
+    remark = Column(String(300))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    version = relationship("CommitmentVersion", back_populates="batches")
+
+class CommitmentImpact(Base):
+    """承诺版本生效时重算出的物料缺口与受影响生产批次快照"""
+    __tablename__ = "commitment_impacts"
+    id = Column(Integer, primary_key=True, index=True)
+    version_id = Column(Integer, ForeignKey("commitment_versions.id"), nullable=False)
+    purchase_order_id = Column(Integer, ForeignKey("purchase_orders.id"), nullable=False)
+    production_batch_id = Column(Integer, ForeignKey("production_batches.id"), nullable=False)
+    vehicle_model_id = Column(Integer, ForeignKey("vehicle_models.id"), nullable=False)
+    material_id = Column(Integer, ForeignKey("materials.id"), nullable=False)
+    required_quantity = Column(Integer, nullable=False)
+    covered_quantity = Column(Integer, nullable=False)
+    shortage_quantity = Column(Integer, nullable=False)
+    available_date = Column(Date)
+    delay_days = Column(Integer)
+    impact_level = Column(String(20), nullable=False)
+    remark = Column(String(300))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    version = relationship("CommitmentVersion", back_populates="impacts")
+    production_batch = relationship("ProductionBatch")
+    vehicle_model = relationship("VehicleModel")
+    material = relationship("Material")
+
+    __table_args__ = (
+        UniqueConstraint("version_id", "production_batch_id", name="uq_commitment_impact_version_batch"),
+    )

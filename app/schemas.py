@@ -510,3 +510,118 @@ class SupplierConfirmationStatistics(BaseModel):
 class ExtendedStatisticsResponse(StatisticsResponse):
     supplier_confirmation_stats: SupplierConfirmationStatistics
     supplier_bottlenecks: List[SupplierBottleneckAnalysis]
+
+class CommitmentVersionBatchBase(BaseModel):
+    batch_no: str
+    quantity: int = Field(gt=0)
+    planned_date: date
+    remark: Optional[str] = None
+
+class CommitmentVersionBatchCreate(CommitmentVersionBatchBase):
+    pass
+
+class CommitmentVersionBatch(CommitmentVersionBatchBase):
+    id: int
+    version_id: int
+    created_at: datetime
+    class Config:
+        from_attributes = True
+
+class CommitmentVersionPublish(BaseModel):
+    committed_quantity: int = Field(ge=0)
+    committed_delivery_date: Optional[date] = None
+    signed_by: str = Field(min_length=1)
+    signature_doc: str = Field(min_length=1)
+    signed_at: Optional[datetime] = None
+    note: Optional[str] = None
+    batches: List[CommitmentVersionBatchCreate] = []
+
+class CommitmentVersionWithdraw(BaseModel):
+    reason: Optional[str] = None
+
+class CommitmentVersion(BaseModel):
+    id: int
+    version_no: str
+    purchase_order_id: int
+    version_number: int
+    committed_quantity: int
+    committed_delivery_date: Optional[date] = None
+    delivered_quantity: int
+    adjustable_quantity: int
+    status: str
+    signed_by: str
+    signature_doc: str
+    signed_at: Optional[datetime] = None
+    note: Optional[str] = None
+    published_at: Optional[datetime] = None
+    withdrawn_at: Optional[datetime] = None
+    withdraw_reason: Optional[str] = None
+    created_at: datetime
+    batches: List[CommitmentVersionBatch] = []
+    class Config:
+        from_attributes = True
+
+class CommitmentImpact(BaseModel):
+    id: int
+    version_id: int
+    purchase_order_id: int
+    production_batch_id: int
+    vehicle_model_id: int
+    material_id: int
+    required_quantity: int
+    covered_quantity: int
+    shortage_quantity: int
+    available_date: Optional[date] = None
+    delay_days: Optional[int] = None
+    impact_level: str
+    remark: Optional[str] = None
+    created_at: datetime
+    production_batch: Optional[ProductionBatch] = None
+    class Config:
+        from_attributes = True
+
+class CommitmentVersionDetail(CommitmentVersion):
+    impacts: List[CommitmentImpact] = []
+
+class CommitmentImpactSnapshot(BaseModel):
+    required_quantity: int
+    covered_quantity: int
+    shortage_quantity: int
+    available_date: Optional[date] = None
+    delay_days: Optional[int] = None
+    impact_level: str
+
+class CommitmentScheduleChange(BaseModel):
+    planned_date: date
+    old_quantity: int
+    new_quantity: int
+    delta: int
+    change_type: str
+
+class CommitmentImpactBatchDiff(BaseModel):
+    production_batch_id: int
+    production_batch_no: str
+    vehicle_model_id: int
+    plan_date: Optional[date] = None
+    old_impact: Optional[CommitmentImpactSnapshot] = None
+    new_impact: Optional[CommitmentImpactSnapshot] = None
+    shortage_delta: int
+    available_date_shift_days: Optional[int] = None
+    change_type: str
+
+class CommitmentVersionDiff(BaseModel):
+    purchase_order_id: int
+    order_no: str
+    material_id: int
+    from_version_id: int
+    from_version_number: int
+    to_version_id: int
+    to_version_number: int
+    committed_quantity_delta: int
+    adjustable_quantity_delta: int
+    delivery_date_shift_days: Optional[int] = None
+    schedule_changes: List[CommitmentScheduleChange]
+    impact_diffs: List[CommitmentImpactBatchDiff]
+    old_affected_batches: int
+    new_affected_batches: int
+    summary: str
